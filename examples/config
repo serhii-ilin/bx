@@ -1,0 +1,39 @@
+# bx configuration (~/.config/bx/config)
+#
+# One directive per line; '#' starts a comment. Paths may use ~ and $VARS.
+# Command-line options are applied on top of this file.
+#
+#   rw PATH         extra writable directory (and everything below it)
+#   rw-file PATH    extra writable single file
+#   rw-prefix PATH  writable paths starting with PATH (e.g. ~/.foo.json*)
+#   ro PATH         read-only carve-out inside a writable location
+#   deny PATH       hide PATH completely (no read, no write)
+#   env NAME        keep NAME (glob allowed) when running with --clean-env
+#   set NAME=VALUE  set an environment variable inside the sandbox
+#   clean-env yes   always use the environment allowlist
+#   network no      block network except localhost / unix sockets
+#
+# Raw SBPL rules can go in ~/.config/bx/profile.sb; they are appended last
+# and therefore override everything else.
+
+# --- Extra writable locations -------------------------------------------
+# rw ~/.docker
+# rw ~/.ssh/known_hosts
+# rw ~/.local/share/pipx
+# rw ~/.nvm                    # lets agents `nvm install` / `npm i -g`
+
+# --- Protect files inside the workspace ---------------------------------
+# Writable .git/hooks or .git/config let code run later outside the sandbox.
+# ro $PWD/.git/hooks
+
+# --- Hide secrets ---------------------------------------------------------
+# Note: hiding ~/.ssh breaks git over ssh unless you use an ssh-agent.
+# deny ~/.aws
+# deny ~/.gnupg
+# deny ~/.kube/config
+# deny ~/Library/Application Support/Google/Chrome
+
+# --- Environment --------------------------------------------------------
+# clean-env yes
+# env MY_COMPANY_*
+# set PYTHONDONTWRITEBYTECODE=1

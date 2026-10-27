@@ -1,0 +1,491 @@
+#!/bin/bash
+#
+# bx - run a program (typically a coding agent) inside a macOS sandbox-exec
+# profile:
+#   * the whole filesystem is readable (minus optional `deny` paths)
+#   * writes are limited to temp dirs, the workspace, coding-agent state dirs
+#     (skills, rules, sessions, settings) and package/build caches
+#   * process fork/exec and network are allowed
+#   * the environment is passed through (or reduced to an allowlist with
+#     --clean-env)
+#
+# Usage: bx [bx-options] [--] program [args...]
+#
+# Written for the stock macOS /bin/bash (3.2): no associative arrays, no
+# mapfile, and empty arrays are expanded with the ${a[@]+"${a[@]}"} idiom.
+
+set -euo pipefail
+
+BX_VERSION="1.0.0"
+SANDBOX_EXEC=/usr/bin/sandbox-exec
+BX_CONFIG_DIR="${BX_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/bx}"
+
+# ---------------------------------------------------------------------------
+# Defaults. Paths are relative to $HOME unless absolute.
+# ---------------------------------------------------------------------------
+
+# Coding agent state: settings, sessions, skills, rules, memory, auth, updates.
+AGENT_DIRS=(
+  .claude .local/share/claude .local/state/claude          # Claude Code
+  .codex                                                    # Codex
+  .pi                                                       # pi
+  .devin .devin-shared .config/devin .local/share/devin .local/state/devin
+  .gemini                                                   # Gemini CLI
+  .cursor .local/share/cursor-agent                         # Cursor agent
+  .opencode .config/opencode .local/share/opencode .local/state/opencode
+  .config/amp .local/share/amp                              # Amp
+  .config/goose .local/share/goose .local/state/goose       # Goose
+  .config/crush .local/share/crush                          # Crush
+  .config/kilo .local/share/kilo .local/state/kilo .kilocode
+  .config/github-copilot .copilot                           # Copilot
+  .qwen .factory .kiro .junie .vibe .continue .codeium
+  .agents .config/agents                                    # shared skills/rules
+  .mcp-auth                                                 # MCP OAuth tokens
+  .local/state/gh                                           # gh update checks
+)
+
+# Files written next to $HOME directly (atomic writes create siblings, so these
+# are prefix matches: ~/.claude.json, ~/.claude.json.backup, ~/.claude.json.tmp.*)
+AGENT_PREFIXES=(
+  .claude.json
+)
+
+# Package manager and build caches.
+CACHE_DIRS=(
+  .cache Library/Caches                                     # XDG + macOS caches (pip, uv, poetry, go-build, yarn, ...)
+  .npm .node-gyp .pnpm-store Library/pnpm .local/share/pnpm .yarn .bun/install/cache
+  .m2 .gradle .ivy2/cache .sbt .kube/cache
+  .sdkman/tmp .sdkman/var .sdkman/archives
+  .local/share/uv .cargo/registry .cargo/git go/pkg/mod .matplotlib
+)
+
+# Read-only carve-outs inside the writable cache dirs: files that would let a
+# sandboxed process change how builds behave when run *outside* the sandbox.
+CACHE_RO=(
+  .m2/settings.xml .m2/settings-security.xml .m2/toolchains.xml .m2/extensions.xml
+  .gradle/gradle.properties .gradle/init.gradle .gradle/init.gradle.kts .gradle/init.d
+)
+
+# Environment variables kept by --clean-env (shell glob patterns).
+ENV_KEEP=(
+  PATH HOME USER LOGNAME SHELL TMPDIR TERM TERM_PROGRAM TERM_PROGRAM_VERSION
+  TERM_SESSION_ID COLORTERM COLUMNS LINES LANG LANGUAGE 'LC_*' TZ
+  __CF_USER_TEXT_ENCODING EDITOR VISUAL PAGER LESS 'XDG_*' SSH_AUTH_SOCK
+  'JAVA_*' JAVA_HOME JDK_JAVA_OPTIONS _JAVA_OPTIONS 'MAVEN_*' M2_HOME
+  'GRADLE_*' 'SDKMAN_*' 'KOTLIN_*' 'NODE_*' 'NVM_*' 'NPM_*' 'npm_config_*'
+  'PNPM_*' 'YARN_*' 'BUN_*' 'DENO_*' 'VOLTA_*' COREPACK_HOME
+  'PYTHON*' 'PYENV_*' VIRTUAL_ENV 'CONDA_*' 'UV_*' 'PIP_*' 'POETRY_*' 'PIPX_*'
+  'GO*' 'CARGO_*' 'RUSTUP_*' 'HOMEBREW_*'
+  'ANTHROPIC_*' 'CLAUDE_*' 'OPENAI_*' 'CODEX_*' 'GEMINI_*' 'GOOGLE_*' 'VERTEX_*'
+  'AWS_*' 'AZURE_*' 'OPENROUTER_*' 'MISTRAL_*' 'GROQ_*' 'DEEPSEEK_*' 'XAI_*'
+  'PI_*' 'DEVIN_*' 'CURSOR_*' 'OPENCODE_*' 'AMP_*' 'OLLAMA_*' 'LMSTUDIO_*'
+  'GIT_*' GH_TOKEN GITHUB_TOKEN 'GH_*' 'MCP_*'
+  HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy
+  SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE
+  'BX_*'
+)
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+WORKSPACES=()
+RW_RULES=()       # SBPL filters, e.g. (subpath "/x")
+RO_RULES=()
+DENY_RULES=()
+SET_ENV=()        # NAME=VALUE pairs
+KEEP_ENV=()       # extra names kept by --clean-env
+CLEAN_ENV=0
+NETWORK=1
+USE_CONFIG=1
+FORCE=0
+PRINT_PROFILE=0
+DRY_RUN=0
+VERBOSE=0
+SEEN=$'\n'        # dedupe set for rules
+
+die()  { printf 'bx: %s\n' "$*" >&2; exit 2; }
+warn() { printf 'bx: warning: %s\n' "$*" >&2; }
+
+usage() {
+  cat <<EOF
+bx $BX_VERSION - run a program in a macOS sandbox (read-mostly, write-restricted)
+
+Usage: bx [options] [--] program [args...]
+
+Everything after the program name is passed to it unchanged.
+
+Options:
+  -w, --workspace DIR   Writable workspace (repeatable). Default: the git
+                        top-level of \$PWD, or \$PWD itself.
+      --rw PATH         Extra writable path (repeatable)
+      --ro PATH         Read-only carve-out inside writable paths (repeatable)
+      --deny PATH       Deny reading and writing PATH (repeatable)
+  -e, --env NAME[=VAL]  Set NAME=VAL, or keep NAME under --clean-env (repeatable)
+      --clean-env       Pass only an allowlist of environment variables
+      --no-network      Block network except localhost and unix sockets
+      --no-config       Ignore $BX_CONFIG_DIR/{config,profile.sb}
+      --force           Allow \$HOME or / as a workspace
+      --print-profile   Print the generated sandbox profile and exit
+  -n, --dry-run         Print the command that would run and exit
+  -v, --verbose         Print the sandbox summary to stderr
+      --log             Stream sandbox denials from the system log
+  -V, --version         Print version
+  -h, --help            Show this help
+
+Config: $BX_CONFIG_DIR/config     (rw/ro/deny/env/set/clean-env/network lines)
+        $BX_CONFIG_DIR/profile.sb (raw SBPL appended to the profile)
+
+Examples:
+  bx claude --dangerously-skip-permissions
+  bx codex --dangerously-bypass-approvals-and-sandbox
+  bx -w ../shared-lib --rw ~/.docker -- pi
+  bx --print-profile
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+# Expand a leading ~ and $VAR / ${VAR} references (no command substitution).
+expand_path() {
+  local s=$1 out="" name re='^([^$]*)[$][{]?([A-Za-z_][A-Za-z0-9_]*)[}]?(.*)$'
+  case $s in
+    \~)   s=$HOME ;;
+    \~/*) s="$HOME/${s#\~/}" ;;
+  esac
+  while [[ $s =~ $re ]]; do
+    name=${BASH_REMATCH[2]}
+    out="$out${BASH_REMATCH[1]}${!name-}"
+    s=${BASH_REMATCH[3]}
+  done
+  printf '%s' "$out$s"
+}
+
+# Canonical absolute path (symlinks resolved, as the sandbox sees it). Works
+# for paths that do not exist yet by resolving the closest existing ancestor.
+canon() {
+  local p rest="" base
+  p=$(expand_path "$1")
+  [[ $p == /* ]] || p="$PWD/$p"
+  while [[ $p == */ && $p != / ]]; do p=${p%/}; done
+  while [[ $p != / && ! -e $p && ! -L $p ]]; do
+    rest="/${p##*/}$rest"
+    p=${p%/*}
+    [[ -n $p ]] || p=/
+  done
+  base=$(/bin/realpath "$p" 2>/dev/null) || base=$p
+  [[ $base == / ]] && base=""
+  p="$base$rest"
+  printf '%s' "${p:-/}"
+}
+
+sb_str() {
+  local s=${1//\\/\\\\}
+  printf '"%s"' "${s//\"/\\\"}"
+}
+
+# add_rule ARRAY KIND PATH   (KIND: subpath | literal | prefix)
+add_rule() {
+  local arr=$1 kind=$2 path rule
+  path=$(canon "$3")
+  rule="($kind $(sb_str "$path"))"
+  case $SEEN in *$'\n'"$arr $rule"$'\n'*) return 0 ;; esac
+  SEEN="$SEEN$arr $rule"$'\n'
+  eval "$arr+=(\"\$rule\")"
+}
+
+home_path() { case $1 in /*) printf '%s' "$1" ;; *) printf '%s' "$HOME/$1" ;; esac; }
+
+# ---------------------------------------------------------------------------
+# Config file
+# ---------------------------------------------------------------------------
+load_config() {
+  local file=$1 line key val n=0
+  [[ -f $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n + 1))
+    line=${line%%#*}
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    [[ -n $line ]] || continue
+    key=${line%%[[:space:]]*}
+    val=${line#"$key"}
+    val=${val#"${val%%[![:space:]]*}"}
+    case $key in
+      rw)        add_rule RW_RULES subpath "$val" ;;
+      rw-file)   add_rule RW_RULES literal "$val" ;;
+      rw-prefix) add_rule RW_RULES prefix "$val" ;;
+      ro)        add_rule RO_RULES subpath "$val" ;;
+      deny)      add_rule DENY_RULES subpath "$val" ;;
+      env)       KEEP_ENV+=("$val") ;;
+      set)       [[ $val == *=* ]] || die "$file:$n: 'set' needs NAME=VALUE"
+                 SET_ENV+=("$val") ;;
+      clean-env) case $val in yes|true|on|1|"") CLEAN_ENV=1 ;; *) CLEAN_ENV=0 ;; esac ;;
+      network)   case $val in no|false|off|0) NETWORK=0 ;; *) NETWORK=1 ;; esac ;;
+      *)         die "$file:$n: unknown directive '$key'" ;;
+    esac
+  done < "$file"
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+need_arg() { [[ $# -ge 2 ]] || die "option $1 requires an argument"; }
+
+# First pass only looks for --no-config so the config file can be loaded
+# before command-line options (which then take precedence).
+i=1
+while [[ $i -le $# ]]; do
+  case ${!i} in
+    --) break ;;
+    --no-config) USE_CONFIG=0 ;;
+    -w|--workspace|--rw|--ro|--deny|-e|--env) i=$((i + 1)) ;;
+    -*) ;;
+    *) break ;;
+  esac
+  i=$((i + 1))
+done
+if [[ $USE_CONFIG -eq 1 ]]; then
+  load_config "$BX_CONFIG_DIR/config"
+fi
+
+while [[ $# -gt 0 ]]; do
+  opt=$1
+  # Split --opt=value
+  if [[ $opt == --*=* ]]; then
+    set -- "${opt%%=*}" "${opt#*=}" "${@:2}"
+    opt=$1
+  fi
+  case $opt in
+    -w|--workspace) need_arg "$@"; WORKSPACES+=("$(canon "$2")"); shift 2 ;;
+    --rw)           need_arg "$@"; add_rule RW_RULES subpath "$2"; shift 2 ;;
+    --ro)           need_arg "$@"; add_rule RO_RULES subpath "$2"; shift 2 ;;
+    --deny)         need_arg "$@"; add_rule DENY_RULES subpath "$2"; shift 2 ;;
+    -e|--env)       need_arg "$@"
+                    if [[ $2 == *=* ]]; then SET_ENV+=("$2"); else KEEP_ENV+=("$2"); fi
+                    shift 2 ;;
+    --clean-env)    CLEAN_ENV=1; shift ;;
+    --no-network)   NETWORK=0; shift ;;
+    --no-config)    shift ;;
+    --force)        FORCE=1; shift ;;
+    --print-profile) PRINT_PROFILE=1; shift ;;
+    -n|--dry-run)   DRY_RUN=1; shift ;;
+    -v|--verbose)   VERBOSE=1; shift ;;
+    --log)
+      exec /usr/bin/log stream --style compact --predicate 'sender == "Sandbox"' ;;
+    -V|--version)   echo "bx $BX_VERSION"; exit 0 ;;
+    -h|--help)      usage; exit 0 ;;
+    --)             shift; break ;;
+    -*)             die "unknown option '$opt' (use '--' before the program if it is the program's option)" ;;
+    *)              break ;;
+  esac
+done
+
+if [[ $# -eq 0 && $PRINT_PROFILE -eq 0 ]]; then
+  usage >&2
+  exit 2
+fi
+
+[[ -x $SANDBOX_EXEC ]] || die "$SANDBOX_EXEC not found (bx requires macOS)"
+
+# ---------------------------------------------------------------------------
+# Workspace
+# ---------------------------------------------------------------------------
+if [[ ${#WORKSPACES[@]} -eq 0 ]]; then
+  top=""
+  if command -v git >/dev/null 2>&1; then
+    top=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || top=""
+  fi
+  WORKSPACES=("$(canon "${top:-$PWD}")")
+fi
+
+HOME_C=$(canon "$HOME")
+for ws in "${WORKSPACES[@]}"; do
+  if [[ $FORCE -eq 0 ]]; then
+    if [[ $ws == / || $ws == "$HOME_C" || $HOME_C == "$ws"/* ]]; then
+      die "refusing to use '$ws' as a writable workspace: it contains \$HOME (use --force to override)"
+    fi
+  fi
+  add_rule RW_RULES subpath "$ws"
+  # Linked git worktrees keep objects and refs in the main repository.
+  if command -v git >/dev/null 2>&1 && [[ -d $ws ]]; then
+    common=$(git -C "$ws" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+    if [[ -n $common ]]; then
+      common=$(canon "$common")
+      [[ $common == "$ws"/* ]] || add_rule RW_RULES subpath "$common"
+    fi
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# Built-in writable locations
+# ---------------------------------------------------------------------------
+for p in /private/tmp /private/var/tmp "${TMPDIR:-/private/tmp}"; do
+  add_rule RW_RULES subpath "$p"
+done
+# Per-user Darwin temp and cache dirs (/var/folders/xx/yyyy/{T,C}).
+for k in DARWIN_USER_TEMP_DIR DARWIN_USER_CACHE_DIR; do
+  d=$(/usr/bin/getconf "$k" 2>/dev/null) || d=""
+  [[ -n $d ]] && add_rule RW_RULES subpath "$d"
+done
+
+for p in "${AGENT_DIRS[@]}" "${CACHE_DIRS[@]}"; do
+  add_rule RW_RULES subpath "$(home_path "$p")"
+done
+for p in "${AGENT_PREFIXES[@]}"; do
+  add_rule RW_RULES prefix "$(home_path "$p")"
+done
+
+# Locations overridden through the environment.
+for v in CLAUDE_CONFIG_DIR CODEX_HOME PI_CODING_AGENT_DIR XDG_CACHE_HOME \
+         NPM_CONFIG_CACHE npm_config_cache npm_config_store_dir YARN_CACHE_FOLDER \
+         BUN_INSTALL_CACHE_DIR COREPACK_HOME PIP_CACHE_DIR UV_CACHE_DIR \
+         UV_PYTHON_INSTALL_DIR POETRY_CACHE_DIR PYTHONPYCACHEPREFIX \
+         GOMODCACHE GOCACHE; do
+  [[ -n ${!v-} ]] && add_rule RW_RULES subpath "${!v}"
+done
+if [[ -n ${SDKMAN_DIR-} ]]; then
+  for s in tmp var archives; do add_rule RW_RULES subpath "$SDKMAN_DIR/$s"; done
+fi
+if [[ -n ${CARGO_HOME-} ]]; then
+  for s in registry git; do add_rule RW_RULES subpath "$CARGO_HOME/$s"; done
+fi
+[[ -n ${GOPATH-} ]] && add_rule RW_RULES subpath "${GOPATH%%:*}/pkg/mod"
+if [[ -n ${GRADLE_USER_HOME-} ]]; then
+  add_rule RW_RULES subpath "$GRADLE_USER_HOME"
+  for s in gradle.properties init.gradle init.gradle.kts init.d; do
+    add_rule RO_RULES subpath "$GRADLE_USER_HOME/$s"
+  done
+fi
+
+for p in "${CACHE_RO[@]}"; do
+  add_rule RO_RULES subpath "$(home_path "$p")"
+done
+# bx's own config must never be writable from inside the sandbox.
+add_rule RO_RULES subpath "$BX_CONFIG_DIR"
+
+# ---------------------------------------------------------------------------
+# Profile
+# ---------------------------------------------------------------------------
+print_rules() {
+  local r
+  for r in "$@"; do printf '  %s\n' "$r"; done
+}
+
+build_profile() {
+  cat <<EOF
+(version 1)
+;; Generated by bx $BX_VERSION
+;; Workspace: ${WORKSPACES[*]}
+
+;; Everything not restricted below is allowed: reading the filesystem, mach
+;; and IPC services (keychain, DNS, ...), signals, sysctl, network.
+(allow default)
+
+(allow process-fork)
+(allow process-exec)
+
+;; Writes are denied everywhere ...
+(deny file-write*)
+
+;; ... except devices used by shells and terminals,
+(allow file-write*
+  (regex #"^/dev/(null|zero|random|urandom|tty|ptmx|dtracehelper|stdin|stdout|stderr)$")
+  (regex #"^/dev/ttys[0-9]+$")
+  (regex #"^/dev/fd/[0-9]+$"))
+
+;; ... temp dirs, workspace(s), agent state and caches.
+(allow file-write*
+EOF
+  print_rules "${RW_RULES[@]}"
+  echo ")"
+
+  if [[ ${#RO_RULES[@]} -gt 0 ]]; then
+    printf '\n;; Read-only carve-outs inside writable locations.\n(deny file-write*\n'
+    print_rules "${RO_RULES[@]}"
+    echo ")"
+  fi
+
+  if [[ ${#DENY_RULES[@]} -gt 0 ]]; then
+    printf '\n;; Hidden locations: neither readable nor writable.\n(deny file-read* file-write*\n'
+    print_rules "${DENY_RULES[@]}"
+    echo ")"
+  fi
+
+  if [[ $NETWORK -eq 0 ]]; then
+    cat <<'EOF'
+
+;; Network disabled except loopback and unix domain sockets (DNS, ssh-agent).
+(deny network*)
+(allow network* (remote unix-socket))
+(allow network* (remote ip "localhost:*"))
+(allow network-bind network-inbound (local ip "localhost:*"))
+EOF
+  fi
+
+  if [[ $USE_CONFIG -eq 1 && -f $BX_CONFIG_DIR/profile.sb ]]; then
+    printf '\n;; From %s\n' "$BX_CONFIG_DIR/profile.sb"
+    cat "$BX_CONFIG_DIR/profile.sb"
+  fi
+}
+
+PROFILE=$(build_profile)
+
+if [[ $PRINT_PROFILE -eq 1 ]]; then
+  printf '%s\n' "$PROFILE"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+# Fill in JAVA_HOME when it is not set, so JVM tooling finds a JDK.
+if [[ -z ${JAVA_HOME-} ]]; then
+  if [[ -d ${SDKMAN_DIR:-$HOME/.sdkman}/candidates/java/current ]]; then
+    SET_ENV+=("JAVA_HOME=${SDKMAN_DIR:-$HOME/.sdkman}/candidates/java/current")
+  elif jh=$(/usr/libexec/java_home 2>/dev/null); then
+    SET_ENV+=("JAVA_HOME=$jh")
+  fi
+fi
+SET_ENV+=("BX_SANDBOX=1" "BX_WORKSPACE=${WORKSPACES[0]}")
+
+ENV_CMD=()
+if [[ $CLEAN_ENV -eq 1 ]]; then
+  ENV_CMD=(/usr/bin/env -i)
+  while IFS= read -r name; do
+    for pat in "${ENV_KEEP[@]}" ${KEEP_ENV[@]+"${KEEP_ENV[@]}"}; do
+      # shellcheck disable=SC2254
+      case $name in $pat) ENV_CMD+=("$name=${!name}"); break ;; esac
+    done
+  done < <(compgen -e)
+  ENV_CMD+=("${SET_ENV[@]}")
+else
+  for kv in "${SET_ENV[@]}"; do export "${kv?}"; done
+fi
+
+CMD=(${ENV_CMD[@]+"${ENV_CMD[@]}"} "$SANDBOX_EXEC" -p "$PROFILE" -- "$@")
+
+if [[ $VERBOSE -eq 1 || $DRY_RUN -eq 1 ]]; then
+  {
+    echo "bx: workspace: ${WORKSPACES[*]}"
+    echo "bx: writable:  ${#RW_RULES[@]} locations, read-only carve-outs: ${#RO_RULES[@]}, denied: ${#DENY_RULES[@]}"
+    echo "bx: network:   $([[ $NETWORK -eq 1 ]] && echo on || echo 'loopback only')"
+    echo "bx: env:       $([[ $CLEAN_ENV -eq 1 ]] && echo 'allowlist' || echo 'inherited')"
+  } >&2
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  # Values are not printed: the environment usually holds API keys.
+  if [[ $CLEAN_ENV -eq 1 ]]; then
+    printf 'env -i'
+    for kv in "${ENV_CMD[@]:2}"; do printf ' %s=…' "${kv%%=*}"; done
+    printf ' \\\n  '
+  fi
+  printf '%q -p <profile> --' "$SANDBOX_EXEC"
+  printf ' %q' "$@"
+  echo
+  exit 0
+fi
+
+exec "${CMD[@]}"

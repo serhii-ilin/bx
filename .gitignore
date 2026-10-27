@@ -1,0 +1,4 @@
+tests/.ws.*
+tests/.outside.*
+tests/.repo.*
+.DS_Store
