@@ -8,18 +8,18 @@
 # Without a checkout:
 #   curl -fsSL https://raw.githubusercontent.com/serhii-ilin/bx/main/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --prefix DIR
-# BX_REF selects a branch or tag to download (default: main).
+# This installs the latest release; BX_REF selects a tag or branch instead.
 set -euo pipefail
 
+REPO=serhii-ilin/bx
 BX_TMP=""
 
 # Everything runs from main() so a truncated `curl | bash` download never
 # executes a partial script.
 main() {
-  local repo_url="${BX_BASE_URL:-https://raw.githubusercontent.com/serhii-ilin/bx/${BX_REF:-main}}"
   local prefix="$HOME/.local/bin"
   local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/bx"
-  local link=0 src_dir target
+  local link=0 src_dir target ref repo_url
 
   while [[ $# -gt 0 ]]; do
     case $1 in
@@ -41,6 +41,8 @@ main() {
     :
   else
     [[ $link -eq 0 ]] || die "--link needs a local checkout"
+    ref=${BX_REF:-$(latest_release)}
+    repo_url=${BX_BASE_URL:-https://raw.githubusercontent.com/$REPO/$ref}
     BX_TMP=$(mktemp -d)
     trap 'rm -rf "$BX_TMP"' EXIT
     src_dir=$BX_TMP
@@ -50,6 +52,10 @@ main() {
     fetch "$repo_url/examples/config" "$src_dir/examples/config"
     if ! grep -q '^# bx - run a program' "$src_dir/bin/bx" || ! bash -n "$src_dir/bin/bx"; then
       die "downloaded bin/bx does not look like bx"
+    fi
+    # Tags carry the release number only in their name; stamp it into bx.
+    if [[ $ref =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      /usr/bin/sed -i '' "s/^BX_VERSION=\".*\"\$/BX_VERSION=\"${ref#v}\"/" "$src_dir/bin/bx"
     fi
   fi
 
@@ -83,6 +89,14 @@ main() {
 }
 
 die() { echo "install: $*" >&2; exit 2; }
+
+# Tag of the latest GitHub release, or main when there is none yet.
+latest_release() {
+  local tag
+  tag=$(/usr/bin/curl -fsSI "https://github.com/$REPO/releases/latest" 2>/dev/null |
+        awk 'tolower($1) == "location:" { n = split($2, a, "/"); print a[n] }' | tr -d '\r') || tag=""
+  if [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$tag"; else echo main; fi
+}
 
 fetch() {
   /usr/bin/curl -fsSL --retry 2 -o "$2" "$1" || die "failed to download $1"

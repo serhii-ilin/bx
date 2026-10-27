@@ -81,7 +81,14 @@ To see the full profile, run `bx --print-profile`.
 
 ## Install
 
-One-liner, no checkout needed:
+Homebrew:
+
+```sh
+brew install serhii-ilin/tap/bx
+brew install --HEAD serhii-ilin/tap/bx   # latest main instead of the latest release
+```
+
+One-liner, no checkout or Homebrew needed (installs the latest release):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/serhii-ilin/bx/main/install.sh | bash
@@ -123,6 +130,22 @@ line in the config.
 ./tests/smoke.sh ~/.local/bin/bx
 ```
 
+## Releases
+
+Each push to `main` that passes shellcheck and the macOS smoke tests is
+tagged and released by `.github/workflows/release.yml`:
+
+- The new version is the latest `vX.Y.Z` tag with the patch number bumped.
+  For a minor or major bump, raise `BX_VERSION` in `bin/bx`; the workflow
+  uses it when it is higher than the latest tag.
+- A GitHub Release is created with generated notes.
+- `Formula/bx.rb` in [serhii-ilin/homebrew-tap](https://github.com/serhii-ilin/homebrew-tap)
+  is regenerated from `packaging/homebrew/bx.rb`. This needs a `TAP_DEPLOY_KEY`
+  secret holding a write deploy key for the tap.
+
+`BX_VERSION` in the source tree is only the base version. The installer and
+the Homebrew formula stamp the real release number into the installed `bx`.
+
 ## Limits and notes
 
 - **Agent dirs are writable by design.** An agent can change its own settings
@@ -144,3 +167,7 @@ line in the config.
 - **`sandbox-exec` is deprecated but still works.** Apple has marked it
   deprecated for years, and it is still the mechanism behind Codex's and Claude
   Code's macOS sandboxes.
+
+## License
+
+[MIT](LICENSE)

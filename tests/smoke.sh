@@ -1,5 +1,7 @@
 #!/bin/bash
 # Smoke tests for bx. Run from anywhere: ./tests/smoke.sh [path-to-bx]
+# Single-quoted $VARs are meant to expand inside the sandboxed shell.
+# shellcheck disable=SC2016
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
@@ -12,7 +14,7 @@ PASS=0 FAIL=0
 
 mkdir -p "$WS"
 cleanup() {
-  rm -rf "$WS" "$OUTSIDE" "$CFG" "$HOME/$TAG" "$HOME/.claude/$TAG" "$HOME/.claude.json.$TAG"
+  rm -rf "$WS" "$OUTSIDE" "$CFG" "${HOME:?}/$TAG" "${HOME:?}/.claude/$TAG" "${HOME:?}/.claude.json.$TAG"
 }
 trap cleanup EXIT
 

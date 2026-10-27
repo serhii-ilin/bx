@@ -1,0 +1,104 @@
+# Every push to main that passes the checks is tagged and released:
+#   * the next version is the latest vX.Y.Z tag with the patch number bumped,
+#     or BX_VERSION from bin/bx when that is higher (edit it for minor/major
+#     bumps);
+#   * the Homebrew formula in serhii-ilin/homebrew-tap is updated when the
+#     TAP_DEPLOY_KEY secret (a write deploy key for the tap) is set.
+name: release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TAP_REPO: serhii-ilin/homebrew-tap
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -s bash bin/bx install.sh uninstall.sh tests/smoke.sh
+
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./tests/smoke.sh
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pick version
+        id: version
+        run: |
+          if git tag --points-at HEAD | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "HEAD is already tagged"; exit 0
+          fi
+          base=$(sed -n 's/^BX_VERSION="\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' bin/bx)
+          latest=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            next=$base
+          elif [ "$base" != "$latest" ] && [ "$(printf '%s\n%s\n' "$base" "$latest" | sort -V | tail -1)" = "$base" ]; then
+            next=$base
+          else
+            IFS=. read -r major minor patch <<< "$latest"
+            next="$major.$minor.$((patch + 1))"
+          fi
+          echo "tag=v$next" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$next"
+
+      - name: Create tag and release
+        if: steps.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release create "$TAG" --target "$GITHUB_SHA" --title "bx ${TAG#v}" --generate-notes
+
+      - name: Update Homebrew tap
+        if: steps.version.outputs.tag != ''
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if [ -z "$TAP_DEPLOY_KEY" ]; then
+            echo "::warning::TAP_DEPLOY_KEY is not set; Homebrew tap not updated"
+            exit 0
+          fi
+          version=${TAG#v}
+          curl -fsSL --retry 3 -o bx.tar.gz "https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$TAG.tar.gz"
+          sha=$(sha256sum bx.tar.gz | cut -d' ' -f1)
+
+          key=$RUNNER_TEMP/tap_key
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+          git clone "git@github.com:$TAP_REPO.git" "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          sed -e '/^# /d' -e "s/@VERSION@/$version/g" -e "s/@SHA256@/$sha/g" \
+            packaging/homebrew/bx.rb > "$RUNNER_TEMP/tap/Formula/bx.rb"
+
+          cd "$RUNNER_TEMP/tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/bx.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged"
+          else
+            git commit -m "bx $version"
+            git push
+          fi
