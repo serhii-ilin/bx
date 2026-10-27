@@ -81,6 +81,25 @@ To see the full profile, run `bx --print-profile`.
 
 ## Install
 
+One-liner, no checkout needed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/serhii-ilin/bx/main/install.sh | bash
+```
+
+Options go after `bash -s --`, e.g. `... | bash -s -- --prefix ~/bin`.
+To install a specific tag or branch, set `BX_REF`:
+`curl -fsSL .../install.sh | BX_REF=v1.0.0 bash`.
+
+Uninstall the same way:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/serhii-ilin/bx/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/serhii-ilin/bx/main/uninstall.sh | bash -s -- --purge
+```
+
+From a checkout:
+
 ```sh
 ./install.sh            # copies bin/bx to ~/.local/bin/bx
 ./install.sh --link     # symlink instead (for working on bx)
