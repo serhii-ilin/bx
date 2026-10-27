@@ -1,10 +1,9 @@
-# Homebrew formula template. The release workflow fills in @VERSION@ and
-# @SHA256@ and pushes the result to serhii-ilin/homebrew-tap as Formula/bx.rb.
 class Bx < Formula
   desc "Run coding agents in a macOS sandbox-exec profile"
   homepage "https://github.com/serhii-ilin/bx"
-  url "https://github.com/serhii-ilin/bx/archive/refs/tags/v@VERSION@.tar.gz"
-  sha256 "@SHA256@"
+  # url and sha256 are updated by .github/workflows/release.yml on every release.
+  url "https://github.com/serhii-ilin/bx/archive/refs/tags/v1.0.0.tar.gz"
+  sha256 "c94f9d55bd816cc67990ac269b06ad5ff81a842b3f9bffe357c17b03f03838e6"
   license "MIT"
   head "https://github.com/serhii-ilin/bx.git", branch: "main"
 
@@ -25,8 +24,10 @@ class Bx < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/bx --version")
+    # `brew test` itself runs under sandbox-exec, which cannot apply a nested
+    # profile, so only check the profile bx generates.
     (testpath/"ws").mkpath
-    system bin/"bx", "--no-config", "-w", testpath/"ws", "sh", "-c", "echo ok > ws/out"
-    assert_equal "ok\n", (testpath/"ws/out").read
+    profile = shell_output("#{bin}/bx --no-config -w #{testpath}/ws --print-profile")
+    assert_match "(subpath \"#{(testpath/"ws").realpath}\")", profile
   end
 end

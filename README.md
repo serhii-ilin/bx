@@ -81,12 +81,15 @@ To see the full profile, run `bx --print-profile`.
 
 ## Install
 
-Homebrew:
+Homebrew (this repository is its own tap):
 
 ```sh
-brew install serhii-ilin/tap/bx
-brew install --HEAD serhii-ilin/tap/bx   # latest main instead of the latest release
+brew tap serhii-ilin/bx https://github.com/serhii-ilin/bx
+brew install serhii-ilin/bx/bx
 ```
+
+`brew upgrade bx` picks up new releases. Use `brew install --HEAD serhii-ilin/bx/bx`
+for the latest `main`, and `brew uninstall bx && brew untap serhii-ilin/bx` to remove it.
 
 One-liner, no checkout or Homebrew needed (installs the latest release):
 
@@ -139,9 +142,9 @@ tagged and released by `.github/workflows/release.yml`:
   For a minor or major bump, raise `BX_VERSION` in `bin/bx`; the workflow
   uses it when it is higher than the latest tag.
 - A GitHub Release is created with generated notes.
-- `Formula/bx.rb` in [serhii-ilin/homebrew-tap](https://github.com/serhii-ilin/homebrew-tap)
-  is regenerated from `packaging/homebrew/bx.rb`. This needs a `TAP_DEPLOY_KEY`
-  secret holding a write deploy key for the tap.
+- `Formula/bx.rb` is pointed at the new tag and its sha256 in a follow-up
+  commit on `main` by `github-actions[bot]`. Run `git pull --rebase` before
+  your next push. The bot commit itself is not released again.
 
 `BX_VERSION` in the source tree is only the base version. The installer and
 the Homebrew formula stamp the real release number into the installed `bx`.
