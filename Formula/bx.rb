@@ -2,8 +2,8 @@ class Bx < Formula
   desc "Run coding agents in a macOS sandbox-exec profile"
   homepage "https://github.com/serhii-ilin/bx"
   # url and sha256 are updated by .github/workflows/release.yml on every release.
-  url "https://github.com/serhii-ilin/bx/archive/refs/tags/v1.0.2.tar.gz"
-  sha256 "01c9c46583d85a422ae2adf570aaf8275cb17de9b32d36347cd111c2230c49eb"
+  url "https://github.com/serhii-ilin/bx/archive/refs/tags/v1.0.3.tar.gz"
+  sha256 "69d17042f17b184d405cba28d801ae199d4093858265bd1eadcc3bbda8b7afec"
   license "MIT"
   head "https://github.com/serhii-ilin/bx.git", branch: "main"
 
