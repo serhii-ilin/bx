@@ -48,6 +48,8 @@ expect_ok   "write ~/.claude.json sibling"   bx sh -c "echo x > '$HOME/.claude.j
 expect_ok   "write npm cache"                bx sh -c "mkdir -p '$HOME/.npm/$TAG' && rmdir '$HOME/.npm/$TAG'"
 expect_ok   "write maven repository"         bx sh -c "mkdir -p '$HOME/.m2/repository/$TAG' && rmdir '$HOME/.m2/repository/$TAG'"
 expect_fail "write ~/.m2/settings.xml"       bx sh -c ": >> '$HOME/.m2/settings.xml'"
+expect_ok   "write docker buildx state"      bx sh -c "mkdir -p '$HOME/.docker/buildx/$TAG' && rmdir '$HOME/.docker/buildx/$TAG'"
+expect_fail "write ~/.docker/config.json"    bx sh -c ": >> '$HOME/.docker/config.json'"
 expect_fail "write bx config dir"            bx sh -c "mkdir -p '$HOME/.config/bx/$TAG'"
 expect_ok   "read system files"              bx cat /etc/hosts
 expect_ok   "read \$HOME"                    bx ls "$HOME"

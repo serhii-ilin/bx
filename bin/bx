@@ -57,6 +57,7 @@ CACHE_DIRS=(
   .m2 .gradle .ivy2/cache .sbt .kube/cache
   .sdkman/tmp .sdkman/var .sdkman/archives
   .local/share/uv .cargo/registry .cargo/git go/pkg/mod .matplotlib
+  .docker/buildx                                            # buildx builder state (activity, refs)
 )
 
 # Read-only carve-outs inside the writable cache dirs: files that would let a
@@ -342,9 +343,10 @@ for v in CLAUDE_CONFIG_DIR CODEX_HOME PI_CODING_AGENT_DIR XDG_CACHE_HOME \
          NPM_CONFIG_CACHE npm_config_cache npm_config_store_dir YARN_CACHE_FOLDER \
          BUN_INSTALL_CACHE_DIR COREPACK_HOME PIP_CACHE_DIR UV_CACHE_DIR \
          UV_PYTHON_INSTALL_DIR POETRY_CACHE_DIR PYTHONPYCACHEPREFIX \
-         GOMODCACHE GOCACHE; do
+         GOMODCACHE GOCACHE BUILDX_CONFIG; do
   [[ -n ${!v-} ]] && add_rule RW_RULES subpath "${!v}"
 done
+[[ -n ${DOCKER_CONFIG-} ]] && add_rule RW_RULES subpath "$DOCKER_CONFIG/buildx"
 if [[ -n ${SDKMAN_DIR-} ]]; then
   for s in tmp var archives; do add_rule RW_RULES subpath "$SDKMAN_DIR/$s"; done
 fi
