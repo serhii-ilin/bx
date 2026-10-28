@@ -13,8 +13,12 @@ TAG="bx-test-$$"
 PASS=0 FAIL=0
 
 mkdir -p "$WS"
+# Docker creates ~/.docker outside bx; do the same on machines without it.
+DOCKER_CREATED=0
+[[ -d $HOME/.docker ]] || { mkdir "$HOME/.docker" && DOCKER_CREATED=1; }
 cleanup() {
   rm -rf "$WS" "$OUTSIDE" "$CFG" "${HOME:?}/$TAG" "${HOME:?}/.claude/$TAG" "${HOME:?}/.claude.json.$TAG"
+  [[ $DOCKER_CREATED -eq 1 ]] && rmdir "$HOME/.docker/buildx" "$HOME/.docker" 2>/dev/null
 }
 trap cleanup EXIT
 
